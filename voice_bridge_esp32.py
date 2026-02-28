@@ -28,6 +28,7 @@ import argparse
 import glob as globmod
 import io
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -35,6 +36,20 @@ import sys
 import threading
 import time
 import numpy as np
+
+# Load OPENROUTER_API_KEY from environment (set in ~/.zshrc or shell)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+if not OPENROUTER_API_KEY:
+    # Try reading from ~/.zshrc as fallback
+    zshrc = os.path.expanduser("~/.zshrc")
+    if os.path.exists(zshrc):
+        with open(zshrc) as f:
+            for line in f:
+                if "OPENROUTER_API_KEY" in line and "=" in line:
+                    val = line.split("=", 1)[1].strip().strip("'\"")
+                    if val and not val.startswith("$"):
+                        OPENROUTER_API_KEY = val
+                        break
 
 try:
     import sounddevice as sd
@@ -573,11 +588,10 @@ def _send_tts_end(ser) -> None:
 
 def _text_to_speech_and_send(text: str, ser) -> None:
     """Send text to OpenRouter TTS, stream PCM audio back to M5StickC via SPP."""
-    import requests, base64, os
+    import requests, base64
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        print("[TTS] No OPENROUTER_API_KEY set, skipping TTS")
+    if not OPENROUTER_API_KEY:
+        print("[TTS] No OPENROUTER_API_KEY found, skipping TTS")
         return
 
     print(f"[TTS] Generating speech for: {text[:60]}...")
@@ -585,7 +599,7 @@ def _text_to_speech_and_send(text: str, ser) -> None:
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
             },
             json={
