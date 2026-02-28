@@ -678,7 +678,7 @@ def _text_to_speech_and_send(text: str, ser) -> None:
         )
         resp.raise_for_status()
 
-        total_bytes = 0
+        all_pcm = bytearray()
         for line in resp.iter_lines():
             if not line:
                 continue
@@ -694,13 +694,28 @@ def _text_to_speech_and_send(text: str, ser) -> None:
                 if "audio" in delta and "data" in delta["audio"]:
                     pcm = base64.b64decode(delta["audio"]["data"])
                     if pcm:
-                        _send_tts_frame(ser, pcm)
-                        total_bytes += len(pcm)
+                        all_pcm.extend(pcm)
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
 
+        # Send collected PCM in paced 512-byte frames over SPP
+        TTS_CHUNK = 512
+        for i in range(0, len(all_pcm), TTS_CHUNK):
+            _send_tts_frame(ser, bytes(all_pcm[i : i + TTS_CHUNK]))
+            time.sleep(0.05)
         _send_tts_end(ser)
-        print(f"[TTS] Sent {total_bytes} bytes of audio")
+        print(f"[TTS] Sent {len(all_pcm)} bytes of audio")
+
+        # Save debug WAV file
+        if all_pcm:
+            import wave
+            debug_path = os.path.join(os.path.dirname(__file__) or ".", "tts_debug.wav")
+            with wave.open(debug_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(bytes(all_pcm))
+            print(f"[TTS] Debug audio saved: {debug_path}")
 
     except Exception as exc:
         print(f"[TTS] Error: {exc}")

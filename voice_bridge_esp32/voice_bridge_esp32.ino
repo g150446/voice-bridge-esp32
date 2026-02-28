@@ -19,6 +19,7 @@
 #include <BluetoothA2DPSink.h>
 #include <BluetoothSerial.h>
 #include "driver/i2s_std.h"
+#include <math.h>
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -321,39 +322,63 @@ static constexpr size_t   MIC_CHUNK     = 512;  // samples per read (~32ms @ 16k
 static constexpr uint8_t  TTS_MAGIC_0   = 0xAA;
 static constexpr uint8_t  TTS_MAGIC_1   = 0x55;
 
-// I2S TX handle for TTS playback (SOURCE mode)
-static i2s_chan_handle_t ttsTxHandle = nullptr;
+// TTS audio buffer (collected from SPP frames, played after all received)
+static int16_t* ttsBuf     = nullptr;
+static size_t   ttsBufSize = 0;       // allocated size in bytes
+static size_t   ttsBufUsed = 0;       // used bytes
+static constexpr size_t TTS_MAX_BYTES = 192000; // ~4s at 24kHz mono
 
-static void initI2sTTS() {
-    i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    chanCfg.dma_desc_num  = 8;
-    chanCfg.dma_frame_num = 256;
-    chanCfg.auto_clear    = true;
-    ESP_ERROR_CHECK(i2s_new_channel(&chanCfg, &ttsTxHandle, nullptr));
-
-    i2s_std_config_t stdCfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(TTS_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = SPK_BCLK,
-            .ws   = SPK_LRC,
-            .dout = SPK_DOUT,
-            .din  = I2S_GPIO_UNUSED,
-            .invert_flags = { false, false, false },
-        },
-    };
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(ttsTxHandle, &stdCfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(ttsTxHandle));
+static void initTTSBuffer() {
+    if (!ttsBuf) {
+        ttsBuf = (int16_t*)heap_caps_malloc(TTS_MAX_BYTES, MALLOC_CAP_8BIT);
+        ttsBufSize = ttsBuf ? TTS_MAX_BYTES : 0;
+    }
+    ttsBufUsed = 0;
 }
 
-static void deinitI2sTTS() {
-    if (ttsTxHandle) {
-        i2s_channel_disable(ttsTxHandle);
-        i2s_del_channel(ttsTxHandle);
-        ttsTxHandle = nullptr;
+static void playTTSBuffer() {
+    if (!ttsBuf || ttsBufUsed == 0) return;
+    size_t nSamples = ttsBufUsed / sizeof(int16_t);
+    Serial.printf("[TTS] Playing %u samples (%u bytes) via Speaker API\n", nSamples, ttsBufUsed);
+    StickCP2.Mic.end();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    StickCP2.Speaker.begin();
+    StickCP2.Speaker.setVolume(255);
+    StickCP2.Speaker.playRaw(ttsBuf, nSamples, TTS_SAMPLE_RATE, false, 1, 0);
+    // Wait for playback to finish
+    while (StickCP2.Speaker.isPlaying()) {
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
+    StickCP2.Speaker.stop();
+    StickCP2.Speaker.end();
+    Serial.println("[TTS] Playback complete");
+    StickCP2.Mic.begin();
+    ttsBufUsed = 0;
+}
+
+// Play a 1kHz test tone for 2 seconds through Hat SPK2
+static void playTestTone() {
+    Serial.println("[TEST] Playing 1kHz tone via Speaker API...");
+    StickCP2.Mic.end();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    StickCP2.Speaker.begin();
+    StickCP2.Speaker.setVolume(255);
+
+    // Generate 1kHz mono sine wave at 24kHz, 2 seconds
+    static constexpr size_t TONE_SAMPLES = 48000; // 2s at 24kHz
+    int16_t* tone = (int16_t*)heap_caps_malloc(TONE_SAMPLES * 2, MALLOC_CAP_8BIT);
+    if (tone) {
+        for (size_t i = 0; i < TONE_SAMPLES; i++) {
+            tone[i] = (int16_t)(sinf(2.0f * M_PI * 1000.0f * i / 24000.0f) * 30000);
+        }
+        StickCP2.Speaker.playRaw(tone, TONE_SAMPLES, 24000, false, 1, 0);
+        while (StickCP2.Speaker.isPlaying()) vTaskDelay(pdMS_TO_TICKS(50));
+        StickCP2.Speaker.stop();
+        heap_caps_free(tone);
+    }
+    StickCP2.Speaker.end();
+    StickCP2.Mic.begin();
+    Serial.println("[TEST] Tone done");
 }
 
 // SPP connection events (set by callback, processed by micTask)
@@ -419,6 +444,9 @@ static void micTask(void*) {
             // Check for TTS audio frame: [0xAA][0x55][len_hi][len_lo][pcm...]
             if (b == TTS_MAGIC_0) {
                 SerialBT.read(); // consume 0xAA
+                // Wait up to 100ms for next byte
+                unsigned long w = millis();
+                while (!SerialBT.available() && millis() - w < 100) vTaskDelay(1);
                 if (SerialBT.available() && SerialBT.peek() == TTS_MAGIC_1) {
                     SerialBT.read(); // consume 0x55
                     // Read length (2 bytes, big-endian)
@@ -428,48 +456,50 @@ static void micTask(void*) {
                     uint16_t audioLen = (hdr[0] << 8) | hdr[1];
 
                     if (audioLen == 0) {
-                        // End-of-TTS marker
-                        Serial.println("[TTS] Playback complete");
-                        deinitI2sTTS();
+                        // End-of-TTS marker — play buffered audio
+                        Serial.printf("[TTS] Received %u bytes, playing...\n", ttsBufUsed);
+                        SerialBT.printf("DBG:TTS_PLAY bytes=%u\n", ttsBufUsed);
+                        isPlayingTTS = true;
+                        playTTSBuffer();
                         isPlayingTTS = false;
-                        // Restart mic
-                        StickCP2.Mic.begin();
+                        SerialBT.println("DBG:TTS_DONE");
                         continue;
                     }
 
-                    // First TTS frame: init speaker
+                    // First TTS frame: init buffer
                     if (!isPlayingTTS) {
                         isPlayingTTS = true;
-                        StickCP2.Mic.end();   // free GPIO0
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                        initI2sTTS();
-                        Serial.println("[TTS] Playing audio...");
+                        initTTSBuffer();
+                        Serial.printf("[TTS] Buffering audio, first frame len=%u\n", audioLen);
+                        SerialBT.printf("DBG:TTS_START len=%u\n", audioLen);
                     }
 
-                    // Read and play audio data
-                    static uint8_t ttsBuf[2048];
+                    // Read frame data into buffer
+                    static uint8_t frameBuf[2048];
                     uint16_t remaining = audioLen;
                     while (remaining > 0) {
-                        uint16_t toRead = (remaining > sizeof(ttsBuf)) ? sizeof(ttsBuf) : remaining;
+                        uint16_t toRead = (remaining > sizeof(frameBuf)) ? sizeof(frameBuf) : remaining;
                         uint16_t got = 0;
                         unsigned long deadline = millis() + 2000;
                         while (got < toRead && millis() < deadline) {
                             int avail = SerialBT.available();
                             if (avail > 0) {
-                                int rd = SerialBT.readBytes(ttsBuf + got,
+                                int rd = SerialBT.readBytes(frameBuf + got,
                                     min((int)(toRead - got), avail));
                                 got += rd;
                             } else {
                                 vTaskDelay(1);
                             }
                         }
-                        if (got > 0 && ttsTxHandle) {
-                            size_t written = 0;
-                            i2s_channel_write(ttsTxHandle, ttsBuf, got,
-                                              &written, pdMS_TO_TICKS(200));
+                        if (got > 0 && ttsBuf && ttsBufUsed + got <= ttsBufSize) {
+                            memcpy(((uint8_t*)ttsBuf) + ttsBufUsed, frameBuf, got);
+                            ttsBufUsed += got;
                         }
                         remaining -= got;
-                        if (got == 0) break;
+                        if (got == 0) {
+                            Serial.printf("[TTS] Timeout, remaining=%u\n", remaining);
+                            break;
+                        }
                     }
                 } else {
                     // Not TTS frame, treat as text char 0xAA
@@ -527,10 +557,14 @@ static void setupSourceMode() {
     }
     Serial.println("[SOURCE] SPP server started. Waiting for client...");
 
+    // Allocate TTS audio buffer
+    initTTSBuffer();
+    Serial.printf("[SOURCE] TTS buffer: %u bytes\n", ttsBufSize);
+
     // Start mic — ensure speaker is off first (GPIO0 shared)
     StickCP2.Speaker.end();
     StickCP2.Mic.begin();
-    xTaskCreatePinnedToCore(micTask, "micTask", 4096, nullptr, 5,
+    xTaskCreatePinnedToCore(micTask, "micTask", 8192, nullptr, 5,
                             &micTaskHandle, 0);
     Serial.println("[SOURCE] Mic ready. Press BtnA to start transcription.");
 }
@@ -604,6 +638,10 @@ static void handleSerial() {
         delay(200);
         ESP.restart();
 
+    } else if (line.equalsIgnoreCase("tone")) {
+        if (currentMode == MODE_SOURCE) playTestTone();
+        else Serial.println("tone only available in SOURCE mode");
+
     } else {
         Serial.printf("Unknown command: %s  (type 'help')\n", line.c_str());
     }
@@ -615,10 +653,8 @@ void setup() {
     Serial.begin(115200);
 
     auto cfg = M5.config();
-    // Both modes: M5Unified must NOT own I2S_NUM_1
-    // SINK: we drive it ourselves via IDF5 API
-    // SOURCE: hat is unused, GPIO0 must be free for mic PDM WS
-    cfg.external_speaker.hat_spk2 = false;
+    // Hat SPK2 must be enabled for M5Unified Speaker API (used for TTS playback)
+    cfg.external_speaker.hat_spk2 = true;
     cfg.internal_spk              = false;
     StickCP2.begin(cfg);
 
