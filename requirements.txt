@@ -1,3 +1,5 @@
 sounddevice
 numpy
 pyserial
+requests
+pyobjc-framework-IOBluetooth

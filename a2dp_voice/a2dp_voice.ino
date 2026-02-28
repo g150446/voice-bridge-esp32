@@ -17,7 +17,7 @@
 #include <M5StickCPlus2.h>
 #include <Preferences.h>
 #include <BluetoothA2DPSink.h>
-#include <BluetoothA2DPSource.h>
+#include <BluetoothSerial.h>
 #include "driver/i2s_std.h"
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,7 @@ static constexpr size_t     RING_BUF_SAMPLES = 4096; // SOURCE ring buffer
 static const char*          PREFS_NS             = "a2dp_voice";
 static const char*          PREFS_KEY_MODE        = "mode";
 static const char*          PREFS_KEY_REMOTE      = "remote"; // Mac BT name for SOURCE
+static const char*          PREFS_KEY_MAC         = "mac_addr"; // Mac BT MAC (6-byte blob)
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -45,7 +46,7 @@ static volatile bool audioActive  = false;
 // SINK: IDF5 I2S TX channel handle
 static i2s_chan_handle_t i2sTxHandle = nullptr;
 
-// SOURCE: mono ring buffer (mic → BT callback)
+// SOURCE: mono ring buffer (mic → SPP)
 static int16_t          ringBuf[RING_BUF_SAMPLES];
 static volatile size_t  ringHead = 0;
 static volatile size_t  ringTail = 0;
@@ -54,6 +55,17 @@ static portMUX_TYPE     ringMux  = portMUX_INITIALIZER_UNLOCKED;
 // Display
 static int dispW, dispH;
 static unsigned long lastDisplayUpdate = 0;
+
+// SOURCE / SPP globals
+static BluetoothSerial  SerialBT;
+static volatile bool    sppClientConnected = false;
+static volatile bool    isTranscribing     = false;  // toggled by BtnA
+static TaskHandle_t     micTaskHandle      = nullptr;
+static constexpr uint32_t MIC_SAMPLE_RATE  = 16000; // 16kHz for Whisper
+
+// Transcription result display (received from Python via SPP)
+static String lastTranscription = "";
+static SemaphoreHandle_t textMutex = nullptr;
 
 // ---------------------------------------------------------------------------
 // NVS mode persistence
@@ -81,6 +93,22 @@ static String readRemoteName() {
     String name = p.getString(PREFS_KEY_REMOTE, "");
     p.end();
     return name;
+}
+
+// Read 6-byte BT MAC address from NVS. Returns true if valid.
+static bool readMacAddr(uint8_t out[6]) {
+    Preferences p;
+    p.begin(PREFS_NS, true);
+    size_t n = p.getBytes(PREFS_KEY_MAC, out, 6);
+    p.end();
+    return (n == 6);
+}
+
+static void writeMacAddr(const uint8_t* mac6) {
+    Preferences p;
+    p.begin(PREFS_NS, false);
+    p.putBytes(PREFS_KEY_MAC, mac6, 6);
+    p.end();
 }
 
 static void requestModeSwitch(Mode next) {
@@ -111,29 +139,72 @@ static void drawDisplay() {
         StickCP2.Display.drawString("SOURCE", dispW / 2, 4);
     }
 
-    // --- BT status (middle) ---
+    // --- Status / transcription (middle area) ---
     StickCP2.Display.setFont(&fonts::Font2);
-    StickCP2.Display.setTextDatum(middle_center);
-    if (btConnected) {
-        StickCP2.Display.setTextColor(WHITE);
-        StickCP2.Display.drawString("Connected", dispW / 2, dispH / 2);
+    if (currentMode == MODE_SOURCE) {
+        if (!sppClientConnected) {
+            StickCP2.Display.setTextColor(DARKGREY);
+            StickCP2.Display.setTextDatum(middle_center);
+            StickCP2.Display.drawString("Run on Mac:", dispW / 2, dispH / 2 - 10);
+            StickCP2.Display.setFont(&fonts::Font0);
+            StickCP2.Display.drawString("python a2dp_voice.py transcribe", dispW / 2, dispH / 2 + 10);
+        } else if (isTranscribing) {
+            // Recording indicator
+            StickCP2.Display.setTextColor(RED);
+            StickCP2.Display.setTextDatum(top_center);
+            StickCP2.Display.drawString("* REC", dispW / 2, 30);
+            // Show latest transcription
+            if (textMutex && xSemaphoreTake(textMutex, pdMS_TO_TICKS(10))) {
+                if (lastTranscription.length() > 0) {
+                    StickCP2.Display.setTextColor(WHITE);
+                    StickCP2.Display.setTextDatum(top_left);
+                    StickCP2.Display.setTextWrap(true);
+                    StickCP2.Display.setCursor(4, 50);
+                    // Truncate for display (landscape: ~30 chars wide)
+                    String disp = lastTranscription;
+                    if (disp.length() > 90) disp = disp.substring(disp.length() - 90);
+                    StickCP2.Display.print(disp);
+                }
+                xSemaphoreGive(textMutex);
+            }
+        } else {
+            // Idle — show last transcription if any
+            StickCP2.Display.setTextColor(WHITE);
+            StickCP2.Display.setTextDatum(top_center);
+            StickCP2.Display.drawString("Ready", dispW / 2, 30);
+            if (textMutex && xSemaphoreTake(textMutex, pdMS_TO_TICKS(10))) {
+                if (lastTranscription.length() > 0) {
+                    StickCP2.Display.setTextColor(LIGHTGREY);
+                    StickCP2.Display.setTextDatum(top_left);
+                    StickCP2.Display.setTextWrap(true);
+                    StickCP2.Display.setCursor(4, 50);
+                    String disp = lastTranscription;
+                    if (disp.length() > 90) disp = disp.substring(disp.length() - 90);
+                    StickCP2.Display.print(disp);
+                }
+                xSemaphoreGive(textMutex);
+            }
+        }
     } else {
-        StickCP2.Display.setTextColor(DARKGREY);
-        StickCP2.Display.drawString("Searching...", dispW / 2, dispH / 2);
-    }
-
-    // --- Audio active indicator ---
-    if (audioActive && btConnected) {
-        StickCP2.Display.fillCircle(dispW / 2, dispH / 2 + 20, 5, ORANGE);
+        StickCP2.Display.setTextDatum(middle_center);
+        if (btConnected) {
+            StickCP2.Display.setTextColor(WHITE);
+            StickCP2.Display.drawString("Connected", dispW / 2, dispH / 2);
+        } else {
+            StickCP2.Display.setTextColor(DARKGREY);
+            StickCP2.Display.drawString("Searching...", dispW / 2, dispH / 2);
+        }
     }
 
     // --- Button hints (bottom) ---
     StickCP2.Display.setFont(&fonts::Font2);
     StickCP2.Display.setTextColor(YELLOW);
     StickCP2.Display.setTextDatum(bottom_left);
-    StickCP2.Display.drawString("[A]=SINK", 4, dispH - 2);
+    if (currentMode == MODE_SOURCE) {
+        StickCP2.Display.drawString(isTranscribing ? "[A]=STOP" : "[A]=REC", 4, dispH - 2);
+    }
     StickCP2.Display.setTextDatum(bottom_right);
-    StickCP2.Display.drawString("[B]=SRC", dispW - 4, dispH - 2);
+    StickCP2.Display.drawString(currentMode == MODE_SOURCE ? "[B]=SINK" : "[B]=SRC", dispW - 4, dispH - 2);
 
     StickCP2.Display.display();
 }
@@ -220,82 +291,121 @@ static void setupSinkMode() {
 }
 
 // ---------------------------------------------------------------------------
-// SOURCE mode: mic task + ring buffer
+// SOURCE mode: SPP (Bluetooth Serial) — mic → BT serial stream
 // ---------------------------------------------------------------------------
 
-// Core 0 task: continuously read mic into ring buffer
+// Frame header: [0x55][0xAA][len_hi][len_lo][pcm_data...]
+static constexpr uint8_t  FRAME_MAGIC_0 = 0x55;
+static constexpr uint8_t  FRAME_MAGIC_1 = 0xAA;
+static constexpr size_t   MIC_CHUNK     = 512;  // samples per read (~32ms @ 16kHz)
+
+// SPP connection events (set by callback, processed by micTask)
+static volatile bool sppEventConnect = false;
+static volatile bool sppEventDisconnect = false;
+
+// SPP connection callback — runs in BT task, do NOT use Serial here
+static void sppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
+    if (event == ESP_SPP_SRV_OPEN_EVT) {
+        sppEventConnect = true;
+    } else if (event == ESP_SPP_CLOSE_EVT) {
+        sppEventDisconnect = true;
+    }
+}
+
+// Core 0 task: read mic when transcribing, read SPP text results
 static void micTask(void*) {
-    static int16_t chunk[256];
+    static int16_t chunk[MIC_CHUNK];
+    uint8_t header[4];
+    header[0] = FRAME_MAGIC_0;
+    header[1] = FRAME_MAGIC_1;
+    String incomingText = "";
+    unsigned long lastClientCheck = 0;
+
     while (true) {
-        if (StickCP2.Mic.record(chunk, 256, 44100)) {
-            portENTER_CRITICAL(&ringMux);
-            for (int i = 0; i < 256; i++) {
-                size_t next = (ringHead + 1) % RING_BUF_SAMPLES;
-                if (next != ringTail) {
-                    ringBuf[ringHead] = chunk[i];
-                    ringHead = next;
-                }
+        // Process SPP events from callback
+        if (sppEventConnect) {
+            sppEventConnect = false;
+            sppClientConnected = true;
+            btConnected = true;
+            Serial.println("[SPP] Client connected (callback)");
+        }
+        if (sppEventDisconnect) {
+            sppEventDisconnect = false;
+            sppClientConnected = false;
+            btConnected = false;
+            audioActive = false;
+            isTranscribing = false;
+            Serial.println("[SPP] Client disconnected (callback)");
+        }
+
+        // Fallback: poll hasClient() every 500ms in case callback didn't fire
+        if (millis() - lastClientCheck > 500) {
+            lastClientCheck = millis();
+            bool has = SerialBT.hasClient();
+            if (has && !sppClientConnected) {
+                sppClientConnected = true;
+                btConnected = true;
+                Serial.println("[SPP] Client detected (poll)");
+            } else if (!has && sppClientConnected) {
+                sppClientConnected = false;
+                btConnected = false;
+                audioActive = false;
+                isTranscribing = false;
+                Serial.println("[SPP] Client lost (poll)");
             }
-            portEXIT_CRITICAL(&ringMux);
+        }
+
+        // Read incoming text from Python (transcription results)
+        while (SerialBT.available()) {
+            char c = (char)SerialBT.read();
+            if (c == '\n') {
+                if (incomingText.length() > 0) {
+                    if (textMutex && xSemaphoreTake(textMutex, pdMS_TO_TICKS(50))) {
+                        lastTranscription = incomingText;
+                        xSemaphoreGive(textMutex);
+                    }
+                    Serial.printf("[STT] %s\n", incomingText.c_str());
+                    incomingText = "";
+                }
+            } else {
+                if (incomingText.length() < 256) incomingText += c;
+            }
+        }
+
+        if (!isTranscribing) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (StickCP2.Mic.record(chunk, MIC_CHUNK, MIC_SAMPLE_RATE)) {
+            uint16_t byteLen = MIC_CHUNK * sizeof(int16_t);
+            header[2] = (byteLen >> 8) & 0xFF;
+            header[3] = byteLen & 0xFF;
+            SerialBT.write(header, 4);
+            SerialBT.write(reinterpret_cast<const uint8_t*>(chunk), byteLen);
         }
         taskYIELD();
     }
 }
 
-// A2DP Source callback — called from BT task (Core 1)
-// Frame layout: { int16_t channel1; int16_t channel2; } at 44100 Hz stereo
-static int32_t sourceDataCallback(Frame *frames, int32_t frameCount) {
-    for (int32_t i = 0; i < frameCount; i++) {
-        portENTER_CRITICAL(&ringMux);
-        int16_t s = (ringTail != ringHead) ? ringBuf[ringTail] : 0;
-        if (ringTail != ringHead) {
-            ringTail = (ringTail + 1) % RING_BUF_SAMPLES;
-        }
-        portEXIT_CRITICAL(&ringMux);
-        frames[i].channel1 = s;
-        frames[i].channel2 = s;  // mono → stereo
-    }
-    audioActive = true;
-    delay(1);  // prevents watchdog reset during sustained streaming
-    return frameCount;
-}
-
 static void setupSourceMode() {
-    Serial.println("[SOURCE] Starting mic...");
-    StickCP2.Mic.begin();  // PDM on GPIO34/GPIO0, uses I2S_NUM_0
-    xTaskCreatePinnedToCore(micTask, "micTask", 4096, nullptr, 5, nullptr, 0);
-    Serial.println("[SOURCE] Mic running, micTask pinned to Core 0.");
+    Serial.println("[SOURCE] Starting SPP as 'M5StickC-MIC'...");
 
-    static BluetoothA2DPSource src;
-    src.set_data_callback_in_frames(sourceDataCallback);
+    textMutex = xSemaphoreCreateMutex();
 
-    src.set_on_connection_state_changed(
-        [](esp_a2d_connection_state_t s, void*) {
-            btConnected = (s == ESP_A2D_CONNECTION_STATE_CONNECTED);
-            if (!btConnected) audioActive = false;
-            Serial.printf("[SOURCE] BT connection: %s\n",
-                s == ESP_A2D_CONNECTION_STATE_CONNECTED    ? "CONNECTED" :
-                s == ESP_A2D_CONNECTION_STATE_DISCONNECTED ? "DISCONNECTED" :
-                s == ESP_A2D_CONNECTION_STATE_CONNECTING   ? "CONNECTING" :
-                                                             "DISCONNECTING");
-        },
-        nullptr);
+    SerialBT.register_callback(sppCallback);
+    if (!SerialBT.begin("M5StickC-MIC", false /* not master */)) {
+        Serial.println("[SOURCE] ERROR: BluetoothSerial.begin() failed");
+        return;
+    }
+    Serial.println("[SOURCE] SPP server started. Waiting for client...");
 
-    src.set_auto_reconnect(false);
-
-    // Read Mac BT name from NVS (set via: python a2dp_voice.py configure --port ...)
-    // If empty → pass nullptr → connect to first available A2DP Sink.
-    static String remoteName = readRemoteName();
-    const char* remote = remoteName.length() > 0 ? remoteName.c_str() : nullptr;
-
-    Serial.printf("[SOURCE] Remote target: %s\n", remote ? remote : "(any A2DP Sink)");
-
-    // Ensure device is discoverable so Mac can find and pair it.
-    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-    Serial.println("[SOURCE] Discoverable. Starting BT as 'M5StickC-MIC'...");
-
-    src.start(remote);  // nullptr → first available A2DP Sink
-    Serial.println("[SOURCE] BT started. Scanning for remote sink...");
+    // Start mic — ensure speaker is off first (GPIO0 shared)
+    StickCP2.Speaker.end();
+    StickCP2.Mic.begin();
+    xTaskCreatePinnedToCore(micTask, "micTask", 4096, nullptr, 5,
+                            &micTaskHandle, 0);
+    Serial.println("[SOURCE] Mic ready. Press BtnA to start transcription.");
 }
 
 // ---------------------------------------------------------------------------
@@ -309,11 +419,19 @@ static void setupSourceMode() {
 //   help              → print command list
 static void printStatus() {
     String remote = readRemoteName();
-    Serial.printf("[STATUS] mode=%s bt=%s audio=%s remote=%s\n",
+    uint8_t mac[6];
+    bool hasMac = readMacAddr(mac);
+    char macStr[18] = "(not set)";
+    if (hasMac) {
+        snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    Serial.printf("[STATUS] mode=%s bt=%s audio=%s remote=%s spp=%s\n",
         currentMode == MODE_SINK ? "SINK" : "SOURCE",
         btConnected  ? "connected"  : "disconnected",
         audioActive  ? "active"     : "idle",
-        remote.length() > 0 ? remote.c_str() : "(any)");
+        remote.length() > 0 ? remote.c_str() : "(any)",
+        sppClientConnected ? "connected" : "disconnected");
 }
 
 static void printHelp() {
@@ -405,13 +523,24 @@ void loop() {
     StickCP2.update();
     handleSerial();
 
-    // BtnA → SINK mode
-    if (StickCP2.BtnA.wasClicked() && currentMode != MODE_SINK) {
-        requestModeSwitch(MODE_SINK);
+    if (StickCP2.BtnA.wasPressed()) {
+        Serial.println("[BTN] BtnA pressed");
+        if (currentMode == MODE_SOURCE) {
+            isTranscribing = !isTranscribing;
+            audioActive = isTranscribing;
+            Serial.printf("[SOURCE] Transcription %s\n",
+                isTranscribing ? "STARTED" : "STOPPED");
+            // Always try to send — write silently fails if no client
+            SerialBT.println(isTranscribing ? "CMD:START" : "CMD:STOP");
+        }
     }
-    // BtnB → SOURCE mode
-    if (StickCP2.BtnB.wasClicked() && currentMode != MODE_SOURCE) {
-        requestModeSwitch(MODE_SOURCE);
+    if (StickCP2.BtnB.wasPressed()) {
+        Serial.println("[BTN] BtnB pressed");
+        if (currentMode == MODE_SOURCE) {
+            requestModeSwitch(MODE_SINK);
+        } else {
+            requestModeSwitch(MODE_SOURCE);
+        }
     }
 
     if (millis() - lastDisplayUpdate > 100) {
