@@ -478,9 +478,14 @@ static void micTask(void*) {
                 continue;
             }
 
-            // Text data (transcription results)
+            // Text data (transcription results or PING)
             char c = (char)SerialBT.read();
             if (c == '\n') {
+                if (incomingText == "PING") {
+                    SerialBT.println("PONG");
+                    incomingText = "";
+                    continue;
+                }
                 if (incomingText.length() > 0) {
                     if (textMutex && xSemaphoreTake(textMutex, pdMS_TO_TICKS(50))) {
                         lastTranscription = incomingText;

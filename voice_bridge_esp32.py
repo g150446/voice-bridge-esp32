@@ -446,36 +446,61 @@ FRAME_MAGIC = b"\x55\xAA"
 SAMPLE_RATE = 16000  # must match firmware MIC_SAMPLE_RATE
 
 
+def _bt_addr_for_name(name_hint: str) -> str:
+    """Look up paired BT device address by name via blueutil."""
+    try:
+        out = subprocess.check_output(
+            ["blueutil", "--paired"], text=True, timeout=5
+        )
+        for line in out.split("\n"):
+            if name_hint.lower() in line.lower():
+                return line.split(",")[0].split(":")[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _bt_connect(bt_addr: str) -> None:
+    """Ensure device is connected at L2CAP level via blueutil."""
+    if not bt_addr:
+        return
+    addr_dash = bt_addr.replace(":", "-")
+    try:
+        print(f"Connecting BT device {addr_dash}...")
+        subprocess.run(
+            ["blueutil", "--connect", addr_dash],
+            capture_output=True, text=True, timeout=10,
+        )
+        time.sleep(2)
+    except Exception as exc:
+        print(f"blueutil connect warning: {exc}")
+
+
 def _ensure_bt_serial_port(name_hint: str = "M5StickC", bt_addr: str = "") -> str:
     """Find or create the macOS BT serial port via SDP discovery."""
-    # Check if port already exists
     patterns = [
         f"/dev/tty.*{name_hint}*",
         "/dev/tty.*M5Stick*",
         "/dev/tty.M5StickC-MIC*",
     ]
+
+    # Resolve BT address early so we can ensure connection
+    if not bt_addr:
+        bt_addr = _bt_addr_for_name(name_hint)
+
+    # Ensure BT is connected before checking ports
+    _bt_connect(bt_addr)
+
+    # Check if port exists
     for pat in patterns:
         matches = globmod.glob(pat)
         if matches:
             return matches[0]
 
     # Port not found — try IOBluetooth SDP discovery
-    if not bt_addr:
-        try:
-            import subprocess
-            out = subprocess.check_output(
-                ["blueutil", "--paired"], text=True, timeout=5
-            )
-            for line in out.split("\n"):
-                if name_hint.lower() in line.lower():
-                    addr = line.split(",")[0].split(":")[1].strip().replace("-", ":")
-                    bt_addr = addr
-                    break
-        except Exception:
-            pass
-
     if bt_addr:
-        print(f"BT serial port not found. Triggering SDP discovery for {bt_addr}...")
+        addr_colon = bt_addr.replace("-", ":")
+        print(f"BT serial port not found. Triggering SDP discovery for {addr_colon}...")
         try:
             import objc
             objc.loadBundle(
@@ -484,7 +509,7 @@ def _ensure_bt_serial_port(name_hint: str = "M5StickC", bt_addr: str = "") -> st
                 module_globals={},
             )
             device_cls = objc.lookUpClass("IOBluetoothDevice")
-            device = device_cls.deviceWithAddressString_(bt_addr)
+            device = device_cls.deviceWithAddressString_(addr_colon)
             if device:
                 device.openConnection()
                 time.sleep(2)
@@ -511,6 +536,45 @@ def _ensure_bt_serial_port(name_hint: str = "M5StickC", bt_addr: str = "") -> st
         f"Available ports: {avail}\n"
         "Make sure M5StickC is in SOURCE mode and paired via BT."
     )
+
+
+def _verify_spp(ser) -> bool:
+    """Send PING and wait for PONG to verify SPP is live."""
+    ser.reset_input_buffer()
+    ser.write(b"PING\n")
+    deadline = time.time() + 3
+    buf = b""
+    while time.time() < deadline:
+        if ser.in_waiting:
+            buf += ser.read(ser.in_waiting)
+            if b"PONG" in buf:
+                return True
+        time.sleep(0.1)
+    return False
+
+
+def _force_reconnect_spp(name_hint: str = "M5StickC") -> str:
+    """Unpair, re-pair, connect to force fresh RFCOMM. Returns port path."""
+    bt_addr = _bt_addr_for_name(name_hint)
+    if not bt_addr:
+        raise RuntimeError(f"No paired BT device matching '{name_hint}'")
+    addr_dash = bt_addr.replace(":", "-")
+    print(f"Forcing BT reconnect for {addr_dash}...")
+    subprocess.run(["blueutil", "--unpair", addr_dash],
+                    capture_output=True, timeout=10)
+    time.sleep(2)
+    subprocess.run(["blueutil", "--pair", addr_dash],
+                    capture_output=True, timeout=10)
+    time.sleep(3)
+    subprocess.run(["blueutil", "--connect", addr_dash],
+                    capture_output=True, timeout=10)
+    time.sleep(3)
+    patterns = ["/dev/tty.*M5Stick*", "/dev/tty.M5StickC-MIC*"]
+    for pat in patterns:
+        matches = globmod.glob(pat)
+        if matches:
+            return matches[0]
+    raise RuntimeError("BT serial port not found after reconnect")
 
 
 def _read_spp_data(ser) -> tuple:
@@ -676,13 +740,20 @@ def run_transcribe(
     except pyserial.SerialException as exc:
         sys.exit(f"Cannot open {bt_port}: {exc}")
 
-    # Wait for SPP connection to establish (device sends data when connected)
-    print(f"SPP port opened. Verifying connection...")
-    time.sleep(2)
-    if ser.in_waiting > 0:
-        print(f"SPP active ({ser.in_waiting} bytes buffered)")
-    else:
-        print(f"SPP waiting for device... (press BtnA on M5StickC to start)")
+    # Verify SPP is actually connected via PING/PONG
+    print("Verifying SPP connection...")
+    time.sleep(1)
+    if not _verify_spp(ser):
+        print("SPP not responding — forcing BT reconnect...")
+        ser.close()
+        bt_port = _force_reconnect_spp()
+        print(f"Reconnected. Opening {bt_port}...")
+        ser = pyserial.Serial(bt_port, 115200, timeout=1)
+        time.sleep(1)
+        if not _verify_spp(ser):
+            sys.exit("SPP still not responding after reconnect. "
+                     "Try rebooting M5StickC and re-running.")
+    print("SPP connection verified.")
 
     print(f"Chunk duration: {chunk_sec}s | Silence threshold: {silence_thresh}")
     print("Press Ctrl+C to stop.\n")
