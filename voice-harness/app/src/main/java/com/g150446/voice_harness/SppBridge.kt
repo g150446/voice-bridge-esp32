@@ -2,8 +2,10 @@ package com.g150446.voice_harness
 
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -35,6 +37,7 @@ class SppBridge {
     }
 
     private var socket: android.bluetooth.BluetoothSocket? = null
+    private val outLock = Any()   // serialises all writes to the output stream
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
@@ -47,7 +50,7 @@ class SppBridge {
         val device = adapter.bondedDevices?.firstOrNull { it.name?.contains("M5") == true }
             ?: throw IllegalStateException("No bonded M5 device found. Pair the M5StickC first.")
         adapter.cancelDiscovery()
-        val sock = device.createRfcommSocketToServiceRecord(SPP_UUID)
+        val sock = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
         sock.connect()
         socket = sock
         verifyPingPong()
@@ -85,6 +88,17 @@ class SppBridge {
         var recording = false
         val pcmBuffer = ByteArrayOutputStream()
         var consecutiveSilent = 0
+
+        // Keep-alive: send a null byte every 10 s so the BT stack doesn't idle-disconnect
+        val keepAliveJob = launch {
+            while (isActive) {
+                delay(5_000)
+                try {
+                    synchronized(outLock) { outputStream.write(0); outputStream.flush() }
+                } catch (_: Exception) {}
+            }
+        }
+
         try {
             while (isActive) {
                 val (type, data) = readFrame(inputStream)
@@ -147,14 +161,18 @@ class SppBridge {
                 }
             }
         } catch (e: IOException) {
-            onLog("[ERR] Connection lost: ${e.message}")
-            onStateChange?.invoke("IDLE")
+            if (isActive) {   // suppress noise when disconnect() closed the socket intentionally
+                onLog("[ERR] Connection lost: ${e.message}")
+                onStateChange?.invoke("IDLE")
+            }
+        } finally {
+            keepAliveJob.cancel()
         }
     }
 
     fun readFrame(inputStream: InputStream): Pair<String, Any?> {
-        val b = try { inputStream.read() } catch (e: IOException) { return Pair("empty", null) }
-        if (b < 0) return Pair("empty", null)
+        val b = inputStream.read()           // IOException propagates to runLoop's catch
+        if (b < 0) throw IOException("stream closed")
         return when (b) {
             0x55 -> {
                 val b2 = inputStream.read()
@@ -370,15 +388,16 @@ class SppBridge {
         frame[2] = ((len shr 8) and 0xFF).toByte()
         frame[3] = (len and 0xFF).toByte()
         chunk.copyInto(frame, 4)
-        out.write(frame)
-        out.flush()
+        synchronized(outLock) { out.write(frame); out.flush() }
     }
 
     fun sendTtsEnd(out: OutputStream) {
-        out.write(TTS_MAGIC)
-        out.write(0)
-        out.write(0)
-        out.flush()
+        synchronized(outLock) {
+            out.write(TTS_MAGIC)
+            out.write(0)
+            out.write(0)
+            out.flush()
+        }
     }
 
     fun disconnect() {

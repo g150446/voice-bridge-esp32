@@ -7,8 +7,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -175,6 +178,20 @@ fun AppRoot(vm: MainViewModel = viewModel()) {
             ) {
                 notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
+        }
+    }
+
+    // Battery optimization exemption — keeps the process alive when screen turns off
+    val batteryOptLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { /* no-op: user made their choice */ }
+    LaunchedEffect(Unit) {
+        val pm = context.getSystemService(PowerManager::class.java)
+        if (!pm.isIgnoringBatteryOptimizations(context.packageName)) {
+            batteryOptLauncher.launch(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                    .setData(Uri.parse("package:${context.packageName}"))
+            )
         }
     }
 

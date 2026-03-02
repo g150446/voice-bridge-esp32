@@ -7,8 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -16,7 +18,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -40,6 +44,8 @@ class BtSppService : Service() {
     private val localTest = LocalTest()
     private var connectJob: Job? = null
     private var testJob: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     val state = MutableStateFlow(BridgeState.IDLE)
     val logs = MutableStateFlow<List<String>>(emptyList())
@@ -63,6 +69,12 @@ class BtSppService : Service() {
     fun connect() {
         connectJob?.cancel()
         state.value = BridgeState.CONNECTING
+        wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VoiceHarness::BtSpp")
+            .also { it.acquire() }
+        wifiLock = (getSystemService(WIFI_SERVICE) as WifiManager)
+            .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "VoiceHarness::BtSpp")
+            .also { it.acquire() }
         startForeground(NOTIF_ID, buildNotification())
         addLog("[BT] Connecting...")
         connectJob = serviceScope.launch {
@@ -71,27 +83,56 @@ class BtSppService : Service() {
                 state.value = BridgeState.CONNECTED
                 addLog("[BT] Connected — PING/PONG verified")
                 updateNotification()
-                sppBridge.runLoop(
-                    apiKey = prefs.getString("openrouter_key", "") ?: "",
-                    model  = prefs.getString("openrouter_model", "openai/gpt-audio-mini")
-                               ?: "openai/gpt-audio-mini",
-                    onLog  = { addLog(it) },
-                    onStateChange = { s ->
-                        state.value = when (s) {
-                            "RECORDING"  -> BridgeState.RECORDING
-                            "PROCESSING" -> BridgeState.PROCESSING
-                            "CONNECTED"  -> BridgeState.CONNECTED
-                            else         -> BridgeState.IDLE
+
+                while (isActive) {
+                    sppBridge.runLoop(
+                        apiKey = prefs.getString("openrouter_key", "") ?: "",
+                        model  = prefs.getString("openrouter_model", "openai/gpt-audio-mini")
+                                   ?: "openai/gpt-audio-mini",
+                        onLog  = { addLog(it) },
+                        onStateChange = { s ->
+                            state.value = when (s) {
+                                "RECORDING"  -> BridgeState.RECORDING
+                                "PROCESSING" -> BridgeState.PROCESSING
+                                "CONNECTED"  -> BridgeState.CONNECTED
+                                else         -> BridgeState.IDLE
+                            }
+                            updateNotification()
                         }
+                    )
+                    if (!isActive) break
+
+                    // runLoop returned — BT connection dropped; retry until restored
+                    var reconnected = false
+                    while (isActive && !reconnected) {
+                        addLog("[BT] Reconnecting in 3s...")
+                        state.value = BridgeState.CONNECTING
                         updateNotification()
+                        delay(3000)
+                        try {
+                            withContext(Dispatchers.IO) {
+                                sppBridge.disconnect()
+                                sppBridge.connect(applicationContext)
+                            }
+                            reconnected = true
+                            state.value = BridgeState.CONNECTED
+                            addLog("[BT] Reconnected")
+                            updateNotification()
+                        } catch (re: CancellationException) {
+                            throw re
+                        } catch (re: Exception) {
+                            addLog("[BT] Reconnect failed: ${re.message}")
+                        }
                     }
-                )
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 state.value = BridgeState.IDLE
                 addLog("[ERR] ${e.message ?: e.javaClass.simpleName}")
                 stopForeground(STOP_FOREGROUND_REMOVE)
+                wakeLock?.release(); wakeLock = null
+                wifiLock?.release(); wifiLock = null
                 stopSelf()
             }
         }
@@ -104,6 +145,8 @@ class BtSppService : Service() {
         state.value = BridgeState.IDLE
         addLog("[BT] Disconnected")
         stopForeground(STOP_FOREGROUND_REMOVE)
+        wakeLock?.release(); wakeLock = null
+        wifiLock?.release(); wifiLock = null
         stopSelf()
     }
 
@@ -147,6 +190,8 @@ class BtSppService : Service() {
         serviceScope.cancel()
         sppBridge.disconnect()
         localTest.stopRecording()
+        wakeLock?.release(); wakeLock = null
+        wifiLock?.release(); wifiLock = null
         super.onDestroy()
     }
 
