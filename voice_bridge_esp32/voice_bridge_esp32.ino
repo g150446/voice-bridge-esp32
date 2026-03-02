@@ -547,6 +547,15 @@ static void micTask(void*) {
         }
 
         if (!isTranscribing) {
+            // Keep-alive: send 1 byte (0x01) to Android every 60 s when connected and idle.
+            // Generates a BT hardware interrupt on Android, preventing deep-sleep disconnection.
+            // readFrame() on Android returns "empty" for any byte that isn't 0x55 or 'C' — safe.
+            static unsigned long lastKeepAlive = 0;
+            if (sppClientConnected && millis() - lastKeepAlive >= 60000) {
+                lastKeepAlive = millis();
+                const uint8_t ka = 0x01;
+                SerialBT.write(&ka, 1);
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }

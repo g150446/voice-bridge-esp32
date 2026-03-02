@@ -32,7 +32,7 @@ class SppBridge {
         const val SAMPLE_RATE = 16000
         const val TTS_CHUNK = 512
         const val SILENCE_THRESH = 0.02f
-        const val SILENCE_BYTES = 48000   // 1.5s × 16000 × 2
+        const val SILENCE_BYTES = 36000   // 1.125s × 16000 × 2
         const val MAX_CHUNK_BYTES = 640000 // 20s × 16000 × 2
     }
 
