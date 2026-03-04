@@ -137,6 +137,15 @@ The key is stored in NVS (non-volatile storage) and persists across reboots.
 | `SET_KEY:<key>` | Store OpenRouter API key in NVS |
 | `help` | Print command list |
 
+## Power Management
+
+The firmware enters **ESP32 light sleep** after 10 seconds of inactivity in the idle state. This reduces power consumption while allowing instant wake-up:
+
+- **Sleep trigger**: No BtnA press for 10 seconds while idle
+- **Wake source**: BtnA press (EXT0 wakeup on GPIO37, active LOW)
+- **On sleep**: Mic, display, and WiFi are shut down
+- **On wake**: Display, WiFi, and mic are restored automatically; the wake button press is consumed so it doesn't trigger recording
+
 ## Hardware Notes
 
 - **GPIO0** is shared between the PDM microphone (WS/clock) and Hat SPK2 (LRC). They cannot run simultaneously — `Mic.end()` must be called before starting the speaker, and vice versa.

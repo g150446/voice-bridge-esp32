@@ -22,6 +22,7 @@
 #include <Preferences.h>
 #include "mbedtls/base64.h"
 #include <driver/i2s_std.h>
+#include <esp_sleep.h>
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -79,6 +80,8 @@ static int           dispW, dispH;
 static unsigned long lastDispMs = 0;
 static String        statusMsg;
 static String        lastResponse;
+static constexpr unsigned long SLEEP_TIMEOUT_MS = 10000;
+static unsigned long lastActivityMs = 0;
 
 // ---------------------------------------------------------------------------
 // WAV header (44 bytes, PCM16 mono)
@@ -329,6 +332,46 @@ static void drawDisplay() {
         StickCP2.Display.drawString("[A] Send", 4, dispH - 2);
 
     StickCP2.Display.display();
+}
+
+// ---------------------------------------------------------------------------
+// Light sleep (enter after SLEEP_TIMEOUT_MS idle, wake on BtnA GPIO37)
+// ---------------------------------------------------------------------------
+static void enterLightSleep() {
+    Serial.println("[SLEEP] Entering light sleep...");
+    Serial.flush();
+
+    StickCP2.Mic.end();
+    StickCP2.Display.sleep();
+    StickCP2.Display.waitDisplay();
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_37, 0);  // BtnA active LOW
+    esp_light_sleep_start();
+    // --- blocked here until wakeup ---
+
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
+    Serial.println("[SLEEP] Woke up!");
+
+    StickCP2.Display.wakeup();
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    StickCP2.Mic.begin();
+    lastActivityMs = millis();
+    drawDisplay();
+
+    // Consume the wake button press + debounce
+    while (StickCP2.BtnA.isPressed()) {
+        StickCP2.update();
+        delay(10);
+    }
+    delay(50);
+    StickCP2.update();
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +915,7 @@ void setup() {
     StickCP2.Speaker.end();
     StickCP2.Mic.begin();
 
+    lastActivityMs = millis();
     drawDisplay();
     Serial.println("=== Ready ===");
 }
@@ -894,6 +938,7 @@ void loop() {
 
     // BtnA: start / stop recording
     if (StickCP2.BtnA.wasPressed()) {
+        lastActivityMs = millis();
         if (state == ST_IDLE) {
             if (apiKey.length() == 0) {
                 statusMsg = "No API Key!";
@@ -919,6 +964,7 @@ void loop() {
                 if (statusMsg.length() == 0) statusMsg = "No response";
             }
             state = ST_IDLE;
+            lastActivityMs = millis();
             StickCP2.Mic.begin();
         }
     }
@@ -943,6 +989,7 @@ void loop() {
                     // Audio already played
                 }
                 state = ST_IDLE;
+                lastActivityMs = millis();
                 StickCP2.Mic.begin();
             }
         }
@@ -952,6 +999,10 @@ void loop() {
     if (millis() - lastDispMs > 150) {
         lastDispMs = millis();
         drawDisplay();
+    }
+
+    if (state == ST_IDLE && (millis() - lastActivityMs > SLEEP_TIMEOUT_MS)) {
+        enterLightSleep();
     }
 
     delay(5);
